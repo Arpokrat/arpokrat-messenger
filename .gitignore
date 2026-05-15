@@ -1,0 +1,25 @@
+# Artifacts
+dist-newstyle/
+result
+.git/
+
+# OS & Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+.DS_Store
+
+# Haskell symbols
+*.o
+*.hi
+*.hie
+
+# Database & Logs
+*.db
+*.db.bak
+logs/
+
+# Android / Multiplatform
+apps/android/app/release
+apps/multiplatform/.kotlin/
