@@ -77,6 +77,23 @@ object PriceService {
   }
 
   /**
+   * Real USD→EUR conversion factor derived from the CoinGecko prices already cached
+   * (each known asset is fetched in both `usd` and `eur`). Returns null until prices
+   * are loaded or if no entry exposes both currencies. Used by the Swap screen, whose
+   * proxy price endpoint only returns USD — this keeps the FIAT estimate in the wallet's
+   * configured currency without inventing an approximate rate.
+   */
+  fun usdToEurRate(): Double? {
+    val prices = currentPrices ?: return null
+    for (byCurrency in prices.values) {
+      val usd = byCurrency["usd"] ?: continue
+      val eur = byCurrency["eur"] ?: continue
+      if (usd > 0.0 && eur > 0.0) return eur / usd
+    }
+    return null
+  }
+
+  /**
    * Calculates the FIAT value of a balance.
    */
   fun getValue(tokenSymbol: String, balance: Double, currency: String): Double {

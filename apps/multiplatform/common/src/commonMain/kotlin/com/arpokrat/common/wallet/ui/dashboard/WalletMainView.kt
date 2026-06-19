@@ -19,7 +19,10 @@ import com.arpokrat.common.wallet.*
 import com.arpokrat.common.wallet.ui.components.*
 import com.arpokrat.common.wallet.ui.onboarding.*
 import com.arpokrat.common.wallet.ui.settings.WalletSettingsView
+import com.arpokrat.common.wallet.ui.transaction.SwapHistoryHeaderButton
+import com.arpokrat.common.wallet.ui.transaction.SwapHistoryScreen
 import com.arpokrat.common.wallet.ui.transaction.WalletScanView
+import com.arpokrat.common.wallet.ui.transaction.WalletSwapView
 import com.arpokrat.res.MR
 import dev.icerock.moko.resources.compose.painterResource
 import dev.icerock.moko.resources.compose.stringResource
@@ -68,6 +71,16 @@ fun WalletMainView(closeWallet: () -> Unit) {
 
   var isLockModalOpen by remember { mutableStateOf(false) }
 
+  // In-flight swap persisted across app restarts (rule 2.4); surfaced as a resume banner.
+  var pendingSwap by remember { mutableStateOf<PendingSwap?>(PendingSwapStore.load()) }
+  // Count of swaps still in progress (local-expiry-aware): drives the dashboard box that collapses
+  // to "X swaps in progress" once there are 2+ simultaneously (tap → history "In progress" tab).
+  var activeSwapCount by remember { mutableStateOf(SwapHistoryStore.list().count { !it.effectiveStatus(System.currentTimeMillis()).isTerminal }) }
+  fun refreshSwapState() {
+    pendingSwap = PendingSwapStore.load()
+    activeSwapCount = SwapHistoryStore.list().count { !it.effectiveStatus(System.currentTimeMillis()).isTerminal }
+  }
+
   fun enforceFullscreenLock() {
     if (isLockModalOpen) return
     isLockModalOpen = true
@@ -112,11 +125,47 @@ fun WalletMainView(closeWallet: () -> Unit) {
     }
   }
 
+  // Foreground keep-alive ONLY — never locks (PIN audit §5). It refreshes the "last foreground
+  // activity" timestamp so that, once the app is backgrounded, the auto-lock delay is measured
+  // from the moment the user actually left. Locking is decided exclusively on resume-from-
+  // background (see the lifecycle observer below). This removes the class of spurious foreground
+  // re-locks (e.g. main-thread jank in the token picker) that also closed the swap flow.
   fun performSecurityCheck() {
-    if (walletManager.shouldAutoLock()) {
-      enforceFullscreenLock()
-    } else if (!isLockModalOpen && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+    if (!isLockModalOpen && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
       walletManager.updateLastActiveTime()
+    }
+  }
+
+  // Broadcasts a transfer on the asset's chain, off the UI thread, with the standard
+  // notifications. Shared by the asset-detail Send flow and the Swap "pay with wallet"
+  // flow (rule 5.3 — no duplication of the per-chain switch).
+  fun broadcastSend(asset: CryptoAsset, dest: String, amount: String, onSuccessUi: () -> Unit = {}) {
+    AppNotificationManager.showSuccess(msgSending)
+    CoroutineScope(Dispatchers.IO).launch {
+      try {
+        val txHash: String? = when (asset.coinType) {
+          CryptoNetwork.POLYGON.id, 80002, CryptoNetwork.ETHEREUM.id, 11155111 ->
+            NetworkFactory.getEvmService(asset.coinType).sendTransaction(walletManager, dest, amount, asset.contractAddress, asset.decimals)
+          CryptoNetwork.SOLANA.id, CryptoNetwork.SOLANA_DEVNET.id ->
+            NetworkFactory.getSolanaService(asset.coinType).sendTransaction(walletManager, dest, amount)
+          CryptoNetwork.BITCOIN.id, CryptoNetwork.BITCOIN_TESTNET.id ->
+            NetworkFactory.getBitcoinService(asset.coinType).sendTransaction(walletManager, dest, amount, asset.coinType)
+          CryptoNetwork.TRON.id, CryptoNetwork.TRON_NILE.id ->
+            NetworkFactory.getTronService(asset.coinType).sendTransaction(walletManager, asset.coinType, dest, amount, asset.contractAddress, asset.decimals)
+          else -> null
+        }
+        withContext(Dispatchers.Main) {
+          if (txHash != null && !txHash.startsWith("Error")) {
+            AppNotificationManager.showSuccess(msgSent)
+            onSuccessUi()
+            manualRefreshTrigger++
+          } else {
+            AppNotificationManager.showError("$msgFailed: ${txHash ?: "Unknown Error (txHash is null)"}")
+          }
+        }
+      } catch (e: Throwable) {
+        withContext(Dispatchers.Main) { AppNotificationManager.showError("CRASH: ${e.message}") }
+      }
     }
   }
 
@@ -131,10 +180,17 @@ fun WalletMainView(closeWallet: () -> Unit) {
 
   DisposableEffect(lifecycleOwner) {
     val observer = LifecycleEventObserver { _, event ->
-      if (event == Lifecycle.Event.ON_RESUME) {
-        if (currentStep == WalletStep.DASHBOARD) {
-          performSecurityCheck()
-        }
+      when (event) {
+        // Record the exact moment we leave the foreground; the auto-lock delay is measured from here.
+        Lifecycle.Event.ON_PAUSE ->
+          if (currentStep == WalletStep.DASHBOARD && !isLockModalOpen) walletManager.updateLastActiveTime()
+        // The ONLY place the wallet auto-locks: returning from background after the delay (PIN audit §5).
+        Lifecycle.Event.ON_RESUME ->
+          if (currentStep == WalletStep.DASHBOARD) {
+            if (walletManager.shouldAutoLock()) enforceFullscreenLock()
+            refreshSwapState()
+          }
+        else -> {}
       }
     }
     lifecycleOwner.lifecycle.addObserver(observer)
@@ -231,6 +287,67 @@ fun WalletMainView(closeWallet: () -> Unit) {
     }
   }
 
+  // Pushes the swap history as its own destination, on the [initialTab] segment (0 = in progress,
+  // 1 = history). Declared before [openSwapFlow] so both the entry screen and the dashboard box can
+  // reach it; resuming an in-progress swap from the list re-enters the flow via [onResume].
+  fun pushSwapHistory(initialTab: Int, onResume: (PendingSwap) -> Unit) {
+    val histBaseline = ModalManager.start.openModalCount()
+    val closeHist: () -> Unit = { while (ModalManager.start.openModalCount() > histBaseline) ModalManager.start.closeModal() }
+    ModalManager.start.showModalCloseable { _ ->
+      SwapHistoryScreen(
+        onResume = onResume,
+        isWalletLocked = { isLockModalOpen },
+        onKeepAlive = { performSecurityCheck() },
+        closeFlow = closeHist,
+        initialTab = initialTab
+      )
+    }
+  }
+
+  // Opens the Swap flow as a stack of separately-pushed destinations (rule 1). [baseline]
+  // is captured before the first push so [closeFlow] can pop the whole sub-stack back to
+  // the calling screen (Form/Confirm/Tracking/Picker/pay each being one modal level).
+  fun openSwapFlow(initialAsset: CryptoAsset?, resume: PendingSwap?) {
+    val baseline = ModalManager.start.openModalCount()
+    val closeFlow: () -> Unit = {
+      while (ModalManager.start.openModalCount() > baseline) ModalManager.start.closeModal()
+      refreshSwapState()
+    }
+    // "View history" opens the history on its "In progress" tab; resuming re-enters the flow.
+    val openHistory: () -> Unit = { pushSwapHistory(0) { swap -> openSwapFlow(initialAsset = null, resume = swap) } }
+    // Destination QR scan — reuses the same scanner as Send (rule 2), pushed on the shared stack.
+    val scanDest: (((String) -> Unit) -> Unit) = { onScanned ->
+      scanSessionId++
+      ModalManager.end.showModalCloseable(
+        endButtons = { if (isDevMode) { Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(end = 16.dp)) { DevModeBadge() } } }
+      ) { closeScanner ->
+        WalletScanView(
+          scanSessionId = scanSessionId,
+          onAddressScanned = { barcode -> onScanned(barcode); closeScanner() },
+          onClose = { closeScanner() }
+        )
+      }
+    }
+    ModalManager.start.showModalCloseable(
+      // "View history" (rule 3) lives on the swap entry's app bar; it stacks above and pops back here.
+      endButtons = { SwapHistoryHeaderButton(onClick = openHistory) }
+    ) { _ ->
+      WalletSwapView(
+        walletManager = walletManager,
+        walletAssets = displayAssets,
+        currency = currency,
+        initialAsset = initialAsset,
+        resumePending = resume,
+        isWalletLocked = { isLockModalOpen },
+        onKeepAlive = { performSecurityCheck() },
+        closeFlow = closeFlow,
+        onPayFromWallet = { asset, dest, amount -> broadcastSend(asset, dest, amount) },
+        onDestScan = scanDest,
+        onOpenHistory = openHistory
+      )
+    }
+  }
+
   ModalView(
     close = closeWallet,
     showAppBar = false
@@ -294,48 +411,7 @@ fun WalletMainView(closeWallet: () -> Unit) {
                       }
                     },
                     onSendConfirm = { dest, amount, onHistoryRefreshRequested ->
-                      AppNotificationManager.showSuccess(msgSending)
-
-                      // Launching the transaction task completely independently of the UI thread
-                      kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                        try {
-                          val txHash: String? = when (liveAsset.coinType) {
-                            CryptoNetwork.POLYGON.id, 80002, CryptoNetwork.ETHEREUM.id, 11155111 -> {
-                              NetworkFactory.getEvmService(liveAsset.coinType)
-                                .sendTransaction(walletManager, dest, amount, liveAsset.contractAddress, liveAsset.decimals)
-                            }
-                            CryptoNetwork.SOLANA.id, CryptoNetwork.SOLANA_DEVNET.id -> {
-                              NetworkFactory.getSolanaService(liveAsset.coinType)
-                                .sendTransaction(walletManager, dest, amount)
-                            }
-                            CryptoNetwork.BITCOIN.id, CryptoNetwork.BITCOIN_TESTNET.id -> {
-                              NetworkFactory.getBitcoinService(liveAsset.coinType)
-                                .sendTransaction(walletManager, dest, amount, liveAsset.coinType)
-                            }
-                            CryptoNetwork.TRON.id, CryptoNetwork.TRON_NILE.id -> {
-                              NetworkFactory.getTronService(liveAsset.coinType)
-                                .sendTransaction(walletManager, liveAsset.coinType, dest, amount, liveAsset.contractAddress, liveAsset.decimals)
-                            }
-                            else -> null
-                          }
-
-                          // Returning to the Main thread strictly for UI updates
-                          kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                            if (txHash != null && !txHash.startsWith("Error")) {
-                              AppNotificationManager.showSuccess(msgSent)
-                              onHistoryRefreshRequested()
-                              manualRefreshTrigger++
-                            } else {
-                              val errorMsg = txHash ?: "Unknown Error (txHash is null)"
-                              AppNotificationManager.showError("$msgFailed: $errorMsg")
-                            }
-                          }
-                        } catch (e: Throwable) {
-                          kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                            AppNotificationManager.showError("CRASH: ${e.message}")
-                          }
-                        }
-                      }
+                      broadcastSend(liveAsset, dest, amount) { onHistoryRefreshRequested() }
                     },
                     onCopy = { text -> clipboardManager.setText(AnnotatedString(text)); AppNotificationManager.showSuccess(msgAddressCopied) },
                     onOpenExplorer = { hash ->
@@ -346,7 +422,10 @@ fun WalletMainView(closeWallet: () -> Unit) {
                       AppNotificationManager.showSuccess(msgExplorer)
                       try { uriHandler.openUri(walletManager.getAddressExplorerTemplate(liveAsset.coinType).replace("{address}", myAddress)) } catch (e: Exception) {}
                     },
-                    onSwapClick = { if (isDevMode) AppNotificationManager.showError(msgDevModeSwap) else AppNotificationManager.showSuccess(msgSwapSoon) },
+                    onSwapClick = {
+                      if (isDevMode) AppNotificationManager.showError(msgDevModeSwap)
+                      else openSwapFlow(initialAsset = liveAsset, resume = null)
+                    },
                     onToggleCurrency = {
                       val newCurr = if (currency == "USD") "EUR" else "USD"
                       walletManager.setCurrency(newCurr)
@@ -358,7 +437,18 @@ fun WalletMainView(closeWallet: () -> Unit) {
                   )
                 }
               },
-              onSwapClick = { if (isDevMode) AppNotificationManager.showError(msgDevModeSwap) else AppNotificationManager.showSuccess(msgSwapSoon) },
+              onSwapClick = {
+                if (isDevMode) AppNotificationManager.showError(msgDevModeSwap)
+                else openSwapFlow(initialAsset = null, resume = null)
+              },
+              pendingSwap = pendingSwap,
+              activeSwapCount = activeSwapCount,
+              onResumeSwap = {
+                pendingSwap?.let { resume -> openSwapFlow(initialAsset = null, resume = resume) }
+              },
+              onOpenSwapHistory = {
+                pushSwapHistory(0) { swap -> openSwapFlow(initialAsset = null, resume = swap) }
+              },
               onBuySellClick = { if (isDevMode) AppNotificationManager.showError(msgDevModeBuy) else AppNotificationManager.showSuccess(msgBuySoon) },
               onSettingsClick = {
                 ModalManager.start.showModalCloseable(

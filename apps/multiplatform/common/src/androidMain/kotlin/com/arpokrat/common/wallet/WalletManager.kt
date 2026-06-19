@@ -243,7 +243,9 @@ actual class WalletManager actual constructor() {
   }
 
   actual fun setAutoLockDelay(delayMs: Long) { securePrefs.edit().putLong(KEY_AUTO_LOCK_DELAY, delayMs).apply() }
-  actual fun getAutoLockDelay(): Long = securePrefs.getLong(KEY_AUTO_LOCK_DELAY, 0L)
+  // Default to 1 minute (not "immediate"): a hair-trigger default re-prompted the PIN on the
+  // slightest interruption (PIN audit §5). Users can still choose "Immediately" explicitly.
+  actual fun getAutoLockDelay(): Long = securePrefs.getLong(KEY_AUTO_LOCK_DELAY, 60_000L)
   actual fun updateLastActiveTime() { securePrefs.edit().putLong(KEY_LAST_ACTIVE_TIME, System.currentTimeMillis()).apply() }
 
   actual fun shouldAutoLock(): Boolean {

@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arpokrat.common.ui.theme.DEFAULT_PADDING
 import com.arpokrat.common.wallet.CryptoAsset
+import com.arpokrat.common.wallet.PendingSwap
 import com.arpokrat.common.wallet.WalletManager
 import com.arpokrat.common.wallet.ui.components.*
 import com.arpokrat.res.MR
@@ -51,6 +52,10 @@ fun WalletHomeView(
   onToggleCurrency: () -> Unit,
   onAssetClick: (CryptoAsset) -> Unit,
   onSwapClick: () -> Unit,
+  pendingSwap: PendingSwap? = null,
+  activeSwapCount: Int = 0,
+  onResumeSwap: () -> Unit = {},
+  onOpenSwapHistory: () -> Unit = {},
   onBuySellClick: () -> Unit,
   onSettingsClick: () -> Unit,
   onRefresh: () -> Unit,
@@ -181,6 +186,58 @@ fun WalletHomeView(
                 WalletSpinner(alpha = loaderAlpha, size = 20)
               }
             }
+          }
+        }
+      }
+
+      // 2+ swaps in progress: collapse to a single "X swaps in progress" box → history "In progress"
+      // tab. A single in-flight swap keeps the detailed resume banner → tracking of that swap.
+      if (activeSwapCount >= 2) {
+        Card(
+          backgroundColor = MaterialTheme.colors.primary.copy(alpha = 0.10f),
+          shape = RoundedCornerShape(16.dp),
+          elevation = 0.dp,
+          border = BorderStroke(1.dp, MaterialTheme.colors.primary.copy(alpha = 0.35f)),
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = DEFAULT_PADDING)
+            .padding(bottom = 12.dp)
+            .clickable { onOpenSwapHistory() }
+        ) {
+          Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.SwapHoriz, null, tint = MaterialTheme.colors.primary, modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+            Text(
+              stringResource(MR.strings.wallet_swap_active_count, activeSwapCount),
+              color = MaterialTheme.colors.onBackground, fontWeight = FontWeight.Bold, fontSize = 15.sp,
+              modifier = Modifier.weight(1f)
+            )
+            Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colors.primary)
+          }
+        }
+      } else if (pendingSwap != null) {
+        Card(
+          backgroundColor = MaterialTheme.colors.primary.copy(alpha = 0.10f),
+          shape = RoundedCornerShape(16.dp),
+          elevation = 0.dp,
+          border = BorderStroke(1.dp, MaterialTheme.colors.primary.copy(alpha = 0.35f)),
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = DEFAULT_PADDING)
+            .padding(bottom = 12.dp)
+            .clickable { onResumeSwap() }
+        ) {
+          Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.SwapHoriz, null, tint = MaterialTheme.colors.primary, modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+              Text(stringResource(MR.strings.wallet_swap_resume_title), color = MaterialTheme.colors.onBackground, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+              Text(
+                stringResource(MR.strings.wallet_swap_resume_subtitle, pendingSwap.fromSymbol.uppercase(), pendingSwap.toSymbol.uppercase()),
+                color = MaterialTheme.colors.onBackground.copy(alpha = 0.6f), fontSize = 12.sp
+              )
+            }
+            Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colors.primary)
           }
         }
       }

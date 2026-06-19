@@ -64,6 +64,8 @@ kotlin {
         // Coil - Wallet
         implementation("io.coil-kt.coil3:coil-compose:3.0.4")
         implementation("io.coil-kt.coil3:coil-network-ktor3:3.0.4")
+        // SVG decoder: most Trocador token icons are .svg (changenow / proxy /swap-icons/*.svg)
+        implementation("io.coil-kt.coil3:coil-svg:3.0.4")
 
         // Ktor
         implementation("io.ktor:ktor-client-core:3.0.3")
